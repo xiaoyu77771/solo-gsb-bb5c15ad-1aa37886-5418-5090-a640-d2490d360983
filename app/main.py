@@ -1,4 +1,4 @@
-"""FastAPI 应用：时间序列异常检测 + 趋势扫描 + 双序列时滞关联扫描接口。"""
+"""FastAPI 应用：时间序列异常检测 + 趋势扫描 + 双序列时滞关联扫描 + 计数器速率接口。"""
 
 from __future__ import annotations
 
@@ -14,10 +14,13 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from . import segments as segment_workflow
+from .counter_rates import compute_counter_rates
 from .detection import analyze_series
 from .incidents import aggregate_incidents
 from .lag_correlation import scan_lag_correlation
 from .models import (
+    CounterRatesRequest,
+    CounterRatesResponse,
     DetectRequest,
     DetectResponse,
     DetectionListResponse,
@@ -59,8 +62,12 @@ app = FastAPI(
         "重采样接口在首末样本闭区间内输出与 anchor_time 对齐的等间隔网格（整数微秒计算），"
         "原始样本落点标 observed，其余点按 linear/previous 补值，"
         "前后样本间隔超过 max_gap_seconds 时标 missing（null），不跨断档外推。"
+        "计数器速率接口对累计读数逐区间差分：负增量在前值距 max_counter、后值距 0 "
+        "均不超过 wrap_tolerance 时按回卷计算，否则判为重置边界；跨度超过 "
+        "max_gap_seconds 的区间标为 unknown；reset 与 unknown 切断连续 epoch "
+        "且不计入汇总（无状态，不入库）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -391,6 +398,33 @@ def resample(req: ResampleRequest) -> dict:
     except ValueError as exc:
         # 网格点数超过上限等业务约束 → 422
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/api/v1/counter-rates", response_model=CounterRatesResponse, tags=["计数器"])
+def counter_rates(req: CounterRatesRequest) -> dict:
+    """无状态计数器速率计算：累计读数逐区间差分（无状态，不入库）。
+
+    - 负增量在前值距 ``max_counter``、后值距 0 均不超过 ``wrap_tolerance``
+      时按**回卷**计算（增量 = ``(max_counter-前值)+1+后值``），否则判为
+      **重置边界**（reset）；
+    - 区间跨度超过 ``max_gap_seconds`` 时标为 **unknown**；
+    - reset 与 unknown 区间不计入汇总，并切断连续 epoch；
+    - 返回逐区间增量 / 每秒速率 / 判定原因、各 epoch 累计增量与整体汇总
+      （汇总仅统计 normal + wrap 区间）。
+    """
+    try:
+        timestamps, values = _prepare_series(req.points, label="points ")
+    except ValueError as exc:
+        # 时间戳无法解析等输入错误统一返回 422（重复时间戳由 _prepare_series 直接抛 422）
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return compute_counter_rates(
+        timestamps,
+        values,
+        max_counter=req.max_counter,
+        wrap_tolerance=req.wrap_tolerance,
+        max_gap_seconds=req.max_gap_seconds,
+    )
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

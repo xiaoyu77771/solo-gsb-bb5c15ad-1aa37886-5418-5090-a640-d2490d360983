@@ -1,0 +1,16 @@
+{
+  "max_counter": 1000,
+  "wrap_tolerance": 10,
+  "max_gap_seconds": 600,
+  "points": [
+    {"timestamp": "2026-09-22T00:00:00Z", "value": 100.0},
+    {"timestamp": "2026-09-22T00:01:00Z", "value": 400.0},
+    {"timestamp": "2026-09-22T00:02:00Z", "value": 995.0},
+    {"timestamp": "2026-09-22T00:03:00Z", "value": 5.0},
+    {"timestamp": "2026-09-22T00:04:00Z", "value": 300.0},
+    {"timestamp": "2026-09-22T00:05:00Z", "value": 50.0},
+    {"timestamp": "2026-09-22T00:06:00Z", "value": 200.0},
+    {"timestamp": "2026-09-22T02:06:00Z", "value": 250.0},
+    {"timestamp": "2026-09-22T02:07:00Z", "value": 350.0}
+  ]
+}

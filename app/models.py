@@ -670,3 +670,112 @@ class ResampleResponse(BaseModel):
     )
 
     model_config = ConfigDict(extra="ignore")
+
+
+class CounterRatesRequest(BaseModel):
+    """无状态计数器速率计算请求。"""
+
+    points: list[PointIn] = Field(
+        min_length=2,
+        description=(
+            "带时间戳的累计计数读数（至少 2 个）；时间戳格式与检测接口一致，"
+            "无需预先排序，服务端自动排序并拒绝重复时间戳；value 必须为有限数值"
+        ),
+    )
+    max_counter: FiniteFloat | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "计数器最大值（含，>0 且有限），取值域视为 [0, max_counter]："
+            "提供后负增量可按回卷判定；省略时一切负增量均判为计数器重置"
+        ),
+    )
+    wrap_tolerance: FiniteFloat = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "回卷判定容差（≥0 且有限）：负增量在前值距 max_counter、后值距 0 "
+            "均不超过该值时按回卷计算（增量 = (max_counter-前值)+1+后值），"
+            "否则判为重置；仅在提供 max_counter 时生效，默认 0（精确贴合才算回卷）"
+        ),
+    )
+    max_gap_seconds: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "允许的最大区间跨度（秒，≥0 且有限）：相邻点间隔超过该值的区间"
+            "标为 unknown 且不计入汇总；省略或为 null 时不限制"
+        ),
+    )
+
+
+class CounterInterval(BaseModel):
+    """相邻两个读数构成的区间及其判定结果。"""
+
+    index: int = Field(description="区间序号（从 0 开始，对应 points[i] → points[i+1]）")
+    start_index: int = Field(description="区间起点在排序后序列中的索引")
+    end_index: int = Field(description="区间终点在排序后序列中的索引")
+    start_time: str
+    end_time: str
+    start_value: float = Field(description="区间起点读数")
+    end_value: float = Field(description="区间终点读数")
+    duration_seconds: float = Field(description="区间时长（秒，恒 > 0）")
+    raw_delta: float = Field(description="原始差值 end_value - start_value（任何区间均回显）")
+    delta: float | None = Field(
+        description="计入汇总的增量（回卷区间按回卷增量）；reset / unknown 为 null"
+    )
+    rate_per_second: float | None = Field(
+        description="每秒速率 delta / duration_seconds；reset / unknown 为 null"
+    )
+    classification: Literal["normal", "wrap", "reset", "unknown"] = Field(
+        description=(
+            "判定类别：normal=增量非负；wrap=按回卷计算；reset=计数器重置边界；"
+            "unknown=跨度超过 max_gap_seconds"
+        )
+    )
+    reason: str = Field(description="判定原因（中文说明）")
+    epoch_index: int | None = Field(
+        description="所属连续 epoch 编号（从 0 开始）；reset / unknown 不属于任何 epoch，为 null"
+    )
+
+
+class CounterEpoch(BaseModel):
+    """一段连续计入区间（normal / wrap）组成的 epoch。"""
+
+    epoch_index: int = Field(description="epoch 编号（从 0 开始）")
+    start_index: int = Field(description="epoch 起点在排序后序列中的索引")
+    end_index: int = Field(description="epoch 终点在排序后序列中的索引")
+    start_time: str
+    end_time: str
+    interval_count: int = Field(description="epoch 包含的区间数（≥1）")
+    total_delta: float = Field(description="epoch 内全部计入区间的增量合计")
+    duration_seconds: float = Field(description="epoch 覆盖的总时长（秒）")
+    average_rate_per_second: float | None = Field(
+        description="epoch 平均速率 total_delta / duration_seconds"
+    )
+
+
+class CounterRatesResponse(BaseModel):
+    point_count: int = Field(description="排序去重后的读数点数")
+    max_counter: float | None = Field(description="回显的计数器最大值；未提供为 null")
+    wrap_tolerance: float = Field(description="回显的回卷判定容差")
+    max_gap_seconds: float | None = Field(description="回显的最大区间跨度；未提供为 null")
+    interval_count: int = Field(description="区间总数（= point_count - 1）")
+    normal_count: int = Field(description="判定为 normal 的区间数")
+    wrap_count: int = Field(description="判定为 wrap（回卷）的区间数")
+    reset_count: int = Field(description="判定为 reset（重置边界）的区间数")
+    unknown_count: int = Field(description="判定为 unknown（跨度超限）的区间数")
+    epoch_count: int = Field(description="连续 epoch 数（reset / unknown 会切断 epoch）")
+    total_delta: float = Field(
+        description="全部计入区间（normal + wrap）的增量合计；排除 reset 与 unknown"
+    )
+    counted_duration_seconds: float = Field(
+        description="全部计入区间的时长合计（秒）；排除 reset 与 unknown"
+    )
+    average_rate_per_second: float | None = Field(
+        description="整体平均速率 total_delta / counted_duration_seconds；无计入区间时为 null"
+    )
+    intervals: list[CounterInterval] = Field(description="逐区间结果（按时间升序）")
+    epochs: list[CounterEpoch] = Field(description="连续 epoch 汇总（按时间升序）")
+
+    model_config = ConfigDict(extra="ignore")

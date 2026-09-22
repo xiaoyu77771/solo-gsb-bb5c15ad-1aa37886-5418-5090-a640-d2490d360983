@@ -1,8 +1,8 @@
 # 时间序列异常检测与趋势扫描 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合与无状态等间隔重采样服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合、无状态等间隔重采样与计数器速率计算服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。每个已保存检测的异常段都可走**处置工作流**：`open → acknowledged → resolved` 单向流转（可附备注），检测详情与列表摘要回显各状态计数。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。每个已保存检测的异常段都可走**处置工作流**：`open → acknowledged → resolved` 单向流转（可附备注），检测详情与列表摘要回显各状态计数。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。计数器速率接口对**累计计数读数**逐区间差分：负增量在前值距 `max_counter`、后值距 0 均不超过 `wrap_tolerance` 时按**回卷**计算，否则判为**重置边界**；跨度超过 `max_gap_seconds` 的区间标为 **unknown**；reset 与 unknown 切断连续 epoch 且不计入汇总，返回逐区间增量 / 每秒速率 / 判定原因与各 epoch 累计增量（无状态，不入库）。
 
 ## 特性
 
@@ -17,6 +17,7 @@
 - **时滞关联扫描**：对 driver / response 双序列，按候选 `lag_seconds` 逐个把 driver 时间平移 `+lag`，再按时间顺序做**贪心一对一最近邻匹配**（容差 `match_tolerance_seconds` 内取最近点，等距取较早 response，已匹配点不复用）；仅对**配对数 ≥ min_pairs 且两侧方差非零**的候选计算 Pearson 相关系数，逐候选返回配对数、相关系数、可用状态与不可用原因；`best_lag` 按 |correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小依次确定，无可用候选时为 `null`。
 - **跨检测事件聚合**：`POST /api/v1/incidents/aggregate` 接收 1~50 个已保存的 `detection_id` 与非负 `gap_seconds`，把各检测的异常段统一按时间排序后顺序扫描——下一段开始时间不晚于当前事件结束时间 `+ gap_seconds`（即**时间重叠、首尾相接或间隔不超过 gap**）即并入同一事件，因此**同一检测的相邻异常段**同样会被合并，邻近关系可链式传递。每个事件返回起止时间、覆盖的 `series_id` / `detection_id`、成员段数、成员中的最大绝对 z 分数，以及按 `(start_time, detection_id, segment_index)` 稳定排序、可回溯到来源段的成员定位。接口只读，不写入或修改任何检测记录。
 - **无状态等间隔重采样**：`POST /api/v1/resample` 在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格，网格时刻 `anchor + k·interval` 全部按**整数微秒**整数运算生成（无浮点累加漂移，最多 10000 点）。原始样本恰落某网格点时标 `observed` 直取样本值；其余点仅当其前后两个样本的间隔 **≤ `max_gap_seconds`** 时补值——`linear` 按实际时间差线性插值、`previous` 取前一样本（前向填充），统一标 `interpolated`；前后样本间隔超限则 `value=null`、`source=missing`，**不跨断档补值，也不向首末样本之外外推**。响应返回三类点计数（`observed_count` / `interpolated_count` / `missing_count`）与逐点结果，并把连续出现的 missing 点汇总为**连续缺口范围** `missing_ranges`（起止网格点、点数、包围样本及其实测间隔）。
+- **计数器速率计算**：`POST /api/v1/counter-rates` 对累计计数读数逐相邻区间差分，输出增量、每秒速率与判定原因。负增量在**前值距 `max_counter`、后值距 0 均不超过 `wrap_tolerance`** 时按**回卷**计算（增量 = `(max_counter−前值)+1+后值`，取值域 `[0, max_counter]`），否则判为**重置边界**（reset）；区间跨度超过 `max_gap_seconds` 时标为 **unknown**（期间计数变化不可知）。reset 与 unknown 区间**不计入汇总并切断连续 epoch**；响应给出逐区间结果、各 epoch 的累计增量 / 时长 / 平均速率，以及只统计 normal + wrap 区间的整体汇总。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **异常段处置工作流**：每个已保存检测的异常段持久化处置状态（`open` / `acknowledged` / `resolved`）、备注 `note` 与更新时间 `updated_at`（新建检测的段默认 `open`）。`POST /api/v1/detections/{id}/segments/{index}/status` 提交目标状态：仅允许 `open → acknowledged → resolved` 单向流转，提交与当前相同的状态为**幂等重放**（返回 200 且状态不变，附非空 `note` 时仅更新备注），越级或回退等非法跳转返回 **409**；检测不存在或段序号越界返回 404。检测详情与列表摘要均回显 `status_counts`（三种状态各自的段数）。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
@@ -35,6 +36,7 @@
 │   ├── incidents.py        # 已保存检测异常段的跨检测事件聚合（只读）
 │   ├── segments.py         # 异常段处置状态机（open → acknowledged → resolved）
 │   ├── resampling.py       # 无状态等间隔重采样（anchor 网格 + 缺口感知补值）
+│   ├── counter_rates.py    # 无状态计数器速率（回卷 / 重置 / 断档感知差分）
 │   ├── models.py           # Pydantic 请求/响应模型、时间戳解析
 │   └── database.py         # SQLite 存储层
 ├── examples/
@@ -43,7 +45,8 @@
 │   ├── request_gap.json            # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
 │   ├── request_trends.json         # 趋势扫描示例请求（先升后降，方向切换）
 │   ├── request_lag_correlation.json # 时滞关联示例请求（response 滞后 driver 600 秒）
-│   └── request_resample.json       # 重采样示例请求（6 小时断档，missing + 连续缺口）
+│   ├── request_resample.json       # 重采样示例请求（6 小时断档，missing + 连续缺口）
+│   └── request_counter_rates.json  # 计数器速率示例请求（回卷 + 重置 + 断档 unknown）
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -78,6 +81,9 @@ curl -X POST http://localhost:8000/api/v1/lag-correlation \
 curl -X POST http://localhost:8000/api/v1/resample \
   -H "Content-Type: application/json" \
   -d @examples/request_resample.json
+curl -X POST http://localhost:8000/api/v1/counter-rates \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_rates.json
 ```
 
 ### 方式二：本地 Python 运行
@@ -275,6 +281,38 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `missing_ranges[]`：连续缺口范围，每个含 `start_index` / `end_index` / `start_time` / `end_time` / `point_count`、包围该缺口的 `before_time` / `after_time` / `before_value` / `after_value`、包围样本实测间隔 `sample_gap_seconds` 与回显的 `max_gap_seconds`；无缺口时为空列表。
 
 注意边界语义：网格严格夹在首末样本之间，故 missing 不会出现在网格两端；样本间隔**恰好等于** `max_gap_seconds` 时仍允许补值（`≤` 比较）；网格与样本的时刻比较、间隔比较都在整数微秒上进行，`max_gap_seconds` 允许亚微秒级浮点（按最近整微秒取整后比较）。仅一个样本且其不落在网格上时返回空网格（各计数为 0）。
+
+### `POST /api/v1/counter-rates` — 计数器速率计算
+
+把带时间戳的**累计计数读数**（单调递增计数器的快照）逐相邻区间差分，输出增量、每秒速率与判定原因，并把连续可计入的区间汇总为 epoch。**无状态接口，结果不入库。**
+
+判定规则（按优先级）：
+
+1. **unknown**：区间时间跨度 **> `max_gap_seconds`**（提供了该参数时）——期间计数变化不可知（可能发生多次回卷 / 重置），不计入汇总；跨度恰好等于上限仍正常计入；
+2. **normal**：原始差值 `end_value − start_value ≥ 0`，按实际差值计入；
+3. **wrap（回卷）**：差值为负，且**前值距 `max_counter`、后值距 0 均不超过 `wrap_tolerance`**（含等号）——按回卷计入，增量 = `(max_counter − 前值) + 1 + 后值`（取值域 `[0, max_counter]`，与 SNMP 32/64 位计数器惯例一致）；
+4. **reset（重置边界）**：其余负增量（包括未提供 `max_counter` 时的一切负增量）——判定为计数器重置，不计入汇总。
+
+**reset 与 unknown 区间都会切断连续 epoch**：epoch 是一串连续的计入区间（normal / wrap），每个 epoch 输出累计增量、覆盖时长与平均速率；顶层汇总（`total_delta` / `counted_duration_seconds` / `average_rate_per_second`）同样只统计计入区间，**排除 reset 与 unknown**。
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `points` | `[{timestamp, value}]` | 必填（≥2） | 累计计数读数；时间戳格式与检测接口一致，无需预先排序，服务端自动排序并拒绝重复时间戳（422）；`value` 必须为有限数值 |
+| `max_counter` | float \| null | `null` | 计数器最大值（含，**>0 且有限**），取值域视为 `[0, max_counter]`；省略时一切负增量均判为 reset |
+| `wrap_tolerance` | float | `0` | 回卷判定容差（**≥0 且有限**）：负增量两侧距边界均不超过该值才按回卷计算；仅在提供 `max_counter` 时生效，默认 0（精确贴合才算回卷） |
+| `max_gap_seconds` | float \| null | `null` | 允许的最大区间跨度（秒，**≥0 且有限**）：超过则区间标 unknown；省略时不限制 |
+
+约束：`points` 至少 2 个且时间戳不重复；`max_counter > 0`；`wrap_tolerance ≥ 0`；`max_gap_seconds ≥ 0`；所有数值参数必须有限（NaN / Infinity 返回 422）。
+
+响应：
+
+- 参数回显：`max_counter` / `wrap_tolerance` / `max_gap_seconds`；
+- 计数：`point_count`、`interval_count`（= 点数 − 1）、`normal_count` / `wrap_count` / `reset_count` / `unknown_count`、`epoch_count`；
+- 汇总：`total_delta`（normal + wrap 区间增量合计）、`counted_duration_seconds`（计入区间时长合计）、`average_rate_per_second`（= 合计增量 / 合计时长；无计入区间时为 `null`）；
+- `intervals[]`：逐区间结果，含 `index`（区间序号，对应 `points[i] → points[i+1]`）、`start_index` / `end_index`、`start_time` / `end_time`、`start_value` / `end_value`、`duration_seconds`、`raw_delta`（原始差值，任何区间均回显）、`delta`（计入增量，reset / unknown 为 `null`）、`rate_per_second`（每秒速率，reset / unknown 为 `null`）、`classification`（`normal` / `wrap` / `reset` / `unknown`）、`reason`（中文判定原因）与 `epoch_index`（所属 epoch 编号，reset / unknown 为 `null`）；
+- `epochs[]`：连续 epoch 汇总，每个含 `epoch_index`、`start_index` / `end_index`、`start_time` / `end_time`、`interval_count`、`total_delta`（epoch 累计增量）、`duration_seconds` 与 `average_rate_per_second`。
 
 ### `GET /health` — 健康检查
 
@@ -510,6 +548,60 @@ curl -s -X POST http://localhost:8000/api/v1/resample \
 
 把 `max_gap_seconds` 提高到 `21600`（断档等长，`≤` 含等号）后，07:00~11:00 会按线性插值补出 17、18、19、20…，`missing_count` 变为 0；改用 `"method": "previous"` 时这些点取前一样本值（06:00 的 16）。`interval_seconds` 支持亚秒但必须为整微秒（如 `0.3` 合法、`0.3000005` 返回 422），亚秒网格时间戳形如 `2026-09-22T00:00:00.300000+00:00`。
 
+### 计数器速率（counter-rates）
+
+```bash
+# 9 个累计读数（max_counter=1000，容差 10，max_gap=600s）：
+# 100 → 400 → 995 → 5（回卷，增量 (1000-995)+1+5=11）→ 300 → 50（重置边界）
+# → 200 →（2 小时断档，unknown）→ 250 → 350。
+# reset 与 unknown 各切断一次 epoch，共 3 段；汇总只统计 normal + wrap 区间。
+curl -s -X POST http://localhost:8000/api/v1/counter-rates \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_rates.json | python -m json.tool
+```
+
+响应（节选）：
+
+```json
+{
+  "point_count": 9,
+  "max_counter": 1000.0,
+  "wrap_tolerance": 10.0,
+  "max_gap_seconds": 600.0,
+  "interval_count": 8,
+  "normal_count": 5,
+  "wrap_count": 1,
+  "reset_count": 1,
+  "unknown_count": 1,
+  "epoch_count": 3,
+  "total_delta": 1451.0,
+  "counted_duration_seconds": 360.0,
+  "average_rate_per_second": 4.0306,
+  "intervals": [
+    {"index": 2, "start_value": 995.0, "end_value": 5.0, "raw_delta": -990.0,
+     "delta": 11.0, "rate_per_second": 0.1833, "classification": "wrap",
+     "reason": "前值 995.0 距 max_counter=1000.0、后值 5.0 距 0 均不超过容差 10.0，按回卷计入：(1000.0-995.0)+1+5.0=11.0",
+     "epoch_index": 0, "..." : "..."},
+    {"index": 4, "start_value": 300.0, "end_value": 50.0, "raw_delta": -250.0,
+     "delta": null, "rate_per_second": null, "classification": "reset",
+     "reason": "增量 -250.0 为负，但前值 300.0 距 max_counter=1000.0 或后值 50.0 距 0 超过容差 10.0，判定为计数器重置边界，不计入汇总",
+     "epoch_index": null, "..." : "..."},
+    {"index": 6, "duration_seconds": 7200.0, "delta": null, "rate_per_second": null,
+     "classification": "unknown", "epoch_index": null, "..." : "..."}
+  ],
+  "epochs": [
+    {"epoch_index": 0, "start_index": 0, "end_index": 4, "interval_count": 4,
+     "total_delta": 1201.0, "duration_seconds": 240.0, "average_rate_per_second": 5.0042},
+    {"epoch_index": 1, "start_index": 5, "end_index": 6, "interval_count": 1,
+     "total_delta": 150.0, "duration_seconds": 60.0, "average_rate_per_second": 2.5},
+    {"epoch_index": 2, "start_index": 7, "end_index": 8, "interval_count": 1,
+     "total_delta": 100.0, "duration_seconds": 60.0, "average_rate_per_second": 1.6667}
+  ]
+}
+```
+
+省略 `max_counter` 时一切负增量判为 reset；省略 `max_gap_seconds` 时不产生 unknown 区间；`wrap_tolerance` 默认 0（仅当前值恰为 `max_counter` 且后值恰为 0 时才算回卷）。
+
 ### 内联 JSON 示例
 
 ```bash
@@ -705,6 +797,19 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 网格点始终位于首末样本闭区间内，因此不需要（也不会）向区间两端外推；missing 只可能出现在内部断档处。整体复杂度约 `O((n + m) log n)`（`n` 样本数、`m` 网格点数，`m ≤ 10000`）；接口无状态，结果不写入 SQLite。
 
+### 计数器速率算法（`POST /api/v1/counter-rates`）
+
+1. 解析全部时间戳并排序、拒绝重复时间戳（422）；每个样本时刻换算为 **epoch 整数微秒**，区间时长按整数微秒差计算（重复时间戳已被拒绝，时长恒 > 0）。
+2. 逐相邻区间按优先级判定：
+   - 提供了 `max_gap_seconds` 且区间跨度 **>** 上限（整数微秒比较，等于上限不算）→ `unknown`，增量与速率置 `null`；
+   - 原始差值 `curr − prev ≥ 0` → `normal`，增量即差值；
+   - 差值为负且提供了 `max_counter`，同时满足 `|max_counter − prev| ≤ wrap_tolerance` 与 `|curr − 0| ≤ wrap_tolerance`（均含等号）→ `wrap`，增量 = `(max_counter − prev) + 1 + curr`（取值域 `[0, max_counter]`，从 `prev` 计到 `max_counter` 再回绕到 `curr`）；
+   - 其余负增量 → `reset`（计数器重置边界），增量与速率置 `null`。
+3. 顺序扫描区间，把连续的计入区间（`normal` / `wrap`）汇成 **epoch**：`reset` 与 `unknown` 区间关闭当前 epoch 且自身不属于任何 epoch。每个 epoch 输出起止点、区间数、累计增量、覆盖时长与平均速率。
+4. 顶层汇总只统计计入区间：`total_delta` 为 normal + wrap 增量合计，`counted_duration_seconds` 为其时长合计，`average_rate_per_second = total_delta / counted_duration_seconds`（无计入区间时为 `null`）——**reset 与 unknown 均被排除**。
+
+整体复杂度 `O(n log n)`（排序主导）；接口无状态，结果不写入 SQLite。
+
 ## 运行测试
 
 ```bash
@@ -712,7 +817,7 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、异常段处置工作流（新建检测段默认 open 且 `updated_at` 取创建时间、`open→acknowledged→resolved` 单向推进、同状态幂等重放且仅附非空 `note` 时更新备注、越级/回退 409 且不写入、检测不存在/段序号越界 404、非法状态值与超长备注 422、无异常段检测计数全 0、详情与列表 `status_counts` 随流转实时回显）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、异常段处置工作流（新建检测段默认 open 且 `updated_at` 取创建时间、`open→acknowledged→resolved` 单向推进、同状态幂等重放且仅附非空 `note` 时更新备注、越级/回退 409 且不写入、检测不存在/段序号越界 404、非法状态值与超长备注 422、无异常段检测计数全 0、详情与列表 `status_counts` 随流转实时回显）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）、计数器速率（normal/wrap/reset/unknown 四类判定与优先级、回卷增量 `(max_counter−前值)+1+后值`、容差等号边界、无 `max_counter` 时负增量一律判重置、`max_gap_seconds` 等号边界与缺省不限制、reset/unknown 切断 epoch 且不计入汇总、epoch 累计增量 / 时长 / 平均速率、全重置时无 epoch 且汇总速率为 null、乱序提交结果一致，以及接口层的重复时间戳 / 不足 2 点 / 空 points / 负容差 / `max_counter ≤ 0` / 负 `max_gap` / 各参数与 value 非有限等 422 校验）。
 
 ## 备注
 
