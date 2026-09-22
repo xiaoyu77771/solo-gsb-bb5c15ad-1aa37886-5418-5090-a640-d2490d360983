@@ -670,3 +670,124 @@ class ResampleResponse(BaseModel):
     )
 
     model_config = ConfigDict(extra="ignore")
+
+
+class CounterRatesRequest(BaseModel):
+    """累计计数器速率计算请求（无状态）。"""
+
+    series_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选的业务序列标识，随响应回显",
+    )
+    points: list[PointIn] = Field(
+        min_length=2,
+        description="带时间戳的累计读数（至少 2 个）；无需预先排序，服务端自动排序并拒绝重复时间戳",
+    )
+    max_counter: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "计数器满量程（≥0 且有限）：负增量且前值距 max_counter、后值距 0 "
+            "均不超过 wrap_tolerance 时按回卷计算；省略时不做回卷判定，负增量一律标重置"
+        ),
+    )
+    wrap_tolerance: FiniteFloat = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "回卷容差（≥0 且有限）：前值距 max_counter 与后值距 0 都不超过该值"
+            "才判定为回卷；默认 0（要求恰好在边界上）。仅在提供 max_counter 时有意义"
+        ),
+    )
+    max_gap_seconds: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "允许计入增量的最大相邻时间跨度（秒，≥0 且有限，含等号）：跨度超过该值"
+            "的区间标 unknown（增量 / 速率为 null）并切断连续 epoch；省略时不做断档判定"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_wrap_params(self) -> "CounterRatesRequest":
+        if self.max_counter is not None and self.wrap_tolerance > self.max_counter:
+            raise ValueError(
+                f"wrap_tolerance 不能大于 max_counter"
+                f"（wrap_tolerance={self.wrap_tolerance} > max_counter={self.max_counter}）"
+            )
+        return self
+
+
+class CounterRateInterval(BaseModel):
+    """相邻两个读数之间的逐区间结果。"""
+
+    index: int = Field(description="区间序号（从 0 开始，共 point_count − 1 个）")
+    start_index: int = Field(description="区间起点读数在排序后序列中的索引")
+    end_index: int = Field(description="区间终点读数在排序后序列中的索引")
+    start_time: str
+    end_time: str
+    elapsed_seconds: float = Field(description="区间实际时间跨度（秒）")
+    from_value: float = Field(description="区间起点读数")
+    to_value: float = Field(description="区间终点读数")
+    delta: float | None = Field(
+        description="区间增量：normal=后值−前值，wrap=(max_counter−前值)+后值；"
+        "reset / unknown 时为 null"
+    )
+    rate_per_second: float | None = Field(
+        description="区间速率 = delta / elapsed_seconds；reset / unknown 时为 null"
+    )
+    reason: Literal["normal", "wrap", "reset", "unknown"] = Field(
+        description=(
+            "判定原因：normal=正常非负增量；wrap=按回卷计算的负增量；"
+            "reset=负增量但不满足回卷条件（重置边界）；unknown=时间跨度超 max_gap_seconds"
+        )
+    )
+    reason_detail: str = Field(description="判定原因的中文解释")
+    epoch_index: int | None = Field(
+        description="该区间所属连续 epoch 序号（从 0 开始）；reset / unknown 不属于任何 epoch，为 null"
+    )
+
+
+class CounterRateEpoch(BaseModel):
+    """连续 epoch：被重置 / unknown 切断的一段连续已知增量。"""
+
+    epoch_index: int = Field(description="epoch 序号（按时间顺序从 0 开始）")
+    start_index: int = Field(description="epoch 首个读数在排序后序列中的索引")
+    end_index: int = Field(description="epoch 末个读数在排序后序列中的索引")
+    start_time: str
+    end_time: str
+    point_count: int = Field(description="epoch 内读数点数（= interval_count + 1）")
+    interval_count: int = Field(description="epoch 内已知区间数（normal + wrap）")
+    total_delta: float = Field(description="epoch 累计增量（各区间增量之和）")
+    duration_seconds: float = Field(description="epoch 总时间跨度（首末读数之差，秒）")
+    rate_per_second: float = Field(description="epoch 平均速率 = total_delta / duration_seconds")
+
+
+class CounterRatesResponse(BaseModel):
+    series_id: str | None = None
+    point_count: int = Field(description="排序后的读数点数")
+    interval_count: int = Field(description="区间总数（= point_count − 1）")
+    max_counter: float | None = Field(description="回显满量程；未提供时为 null")
+    wrap_tolerance: float = Field(description="回显回卷容差")
+    max_gap_seconds: float | None = Field(description="回显断档上限；未提供时为 null")
+    normal_count: int = Field(description="reason=normal 的区间数")
+    wrap_count: int = Field(description="reason=wrap 的区间数")
+    reset_count: int = Field(description="reason=reset 的区间数")
+    unknown_count: int = Field(description="reason=unknown 的区间数")
+    epoch_count: int = Field(description="连续 epoch 总数")
+    total_delta: float = Field(
+        description="汇总累计增量（仅 normal / wrap 区间，排除重置与 unknown）"
+    )
+    total_duration_seconds: float = Field(
+        description="汇总时间跨度（仅 normal / wrap 区间的跨度之和，秒）"
+    )
+    rate_per_second: float | None = Field(
+        description="汇总平均速率 = total_delta / total_duration_seconds；无已知区间时为 null"
+    )
+    intervals: list[CounterRateInterval] = Field(description="按时间升序的逐区间结果")
+    epochs: list[CounterRateEpoch] = Field(
+        description="连续 epoch 列表（按时间升序）；全部区间均为重置 / unknown 时为空列表"
+    )
+
+    model_config = ConfigDict(extra="ignore")

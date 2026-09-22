@@ -1,0 +1,17 @@
+{
+  "series_id": "water-meter-demo",
+  "max_counter": 1000,
+  "wrap_tolerance": 5,
+  "max_gap_seconds": 300,
+  "points": [
+    {"timestamp": "2026-09-22T00:00:00Z", "value": 100.0},
+    {"timestamp": "2026-09-22T00:01:00Z", "value": 110.0},
+    {"timestamp": "2026-09-22T00:02:00Z", "value": 998.0},
+    {"timestamp": "2026-09-22T00:03:00Z", "value": 5.0},
+    {"timestamp": "2026-09-22T00:04:00Z", "value": 20.0},
+    {"timestamp": "2026-09-22T01:00:00Z", "value": 30.0},
+    {"timestamp": "2026-09-22T01:01:00Z", "value": 40.0},
+    {"timestamp": "2026-09-22T01:02:00Z", "value": 10.0},
+    {"timestamp": "2026-09-22T01:03:00Z", "value": 12.0}
+  ]
+}

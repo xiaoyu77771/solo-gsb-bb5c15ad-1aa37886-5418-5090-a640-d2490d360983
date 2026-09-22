@@ -14,10 +14,13 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from . import segments as segment_workflow
+from .counter_rates import compute_counter_rates
 from .detection import analyze_series
 from .incidents import aggregate_incidents
 from .lag_correlation import scan_lag_correlation
 from .models import (
+    CounterRatesRequest,
+    CounterRatesResponse,
     DetectRequest,
     DetectResponse,
     DetectionListResponse,
@@ -59,8 +62,12 @@ app = FastAPI(
         "重采样接口在首末样本闭区间内输出与 anchor_time 对齐的等间隔网格（整数微秒计算），"
         "原始样本落点标 observed，其余点按 linear/previous 补值，"
         "前后样本间隔超过 max_gap_seconds 时标 missing（null），不跨断档外推。"
+        "计数器速率接口对带时间戳的累计读数逐区间计算增量与每秒速率："
+        "正常非负增量直接计入；负增量在前值距 max_counter、后值距 0 均不超过 "
+        "wrap_tolerance 时按回卷计算，否则标注重置边界；时间跨度超过 max_gap_seconds "
+        "的区间标 unknown；重置与 unknown 均切断连续 epoch，汇总值只统计已知增量。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -391,6 +398,40 @@ def resample(req: ResampleRequest) -> dict:
     except ValueError as exc:
         # 网格点数超过上限等业务约束 → 422
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post(
+    "/api/v1/counter-rates",
+    response_model=CounterRatesResponse,
+    tags=["计数器速率"],
+)
+def counter_rates(req: CounterRatesRequest) -> dict:
+    """无状态累计计数器速率：逐区间增量 / 每秒速率 / 判定原因 + epoch 累计。
+
+    - 后值 ≥ 前值：``normal``，增量 = 后值 − 前值；
+    - 负增量且**前值距 ``max_counter``、后值距 0 均不超过 ``wrap_tolerance``**：
+      ``wrap``，增量 = ``(max_counter − 前值) + 后值``；
+    - 其余负增量（或未提供 ``max_counter``）：``reset`` 重置边界，
+      增量 / 速率为 null 并切断连续 epoch；
+    - 区间时间跨度超过 ``max_gap_seconds``（不含等号）：``unknown``，
+      同样为 null 并切断 epoch（断档判定优先）。
+
+    汇总 ``total_delta`` / ``rate_per_second`` 只统计 normal / wrap 区间，
+    排除重置与 unknown；重复时间戳、非有限数值、不足 2 点返回 422。
+    """
+    try:
+        timestamps, values = _prepare_series(req.points, label="points ")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return compute_counter_rates(
+        timestamps,
+        values,
+        max_counter=req.max_counter,
+        wrap_tolerance=req.wrap_tolerance,
+        max_gap_seconds=req.max_gap_seconds,
+        series_id=req.series_id,
+    )
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

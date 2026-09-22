@@ -885,6 +885,173 @@ def test_resample_separate_missing_runs() -> None:
     print("✓ 重采样：多段独立缺口分别报告、正常样本隔开缺口正确")
 
 
+def _counter_series() -> tuple[list[str], list[float]]:
+    """9 个读数：00:00~00:04 每分钟一点，之后跳到 01:00 再每分钟一点。"""
+    ts = [
+        "2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z",
+        "2026-09-22T00:02:00Z", "2026-09-22T00:03:00Z",
+        "2026-09-22T00:04:00Z", "2026-09-22T01:00:00Z",
+        "2026-09-22T01:01:00Z", "2026-09-22T01:02:00Z",
+        "2026-09-22T01:03:00Z",
+    ]
+    values = [100.0, 110.0, 998.0, 5.0, 20.0, 30.0, 40.0, 10.0, 12.0]
+    return ts, values
+
+
+def test_counter_rates_normal_wrap_reset_unknown() -> None:
+    """四类区间齐全：normal/wrap 连续累计，unknown 与 reset 切断 epoch。"""
+    from app.counter_rates import compute_counter_rates
+
+    ts, values = _counter_series()
+    r = compute_counter_rates(
+        ts, values, max_counter=1000, wrap_tolerance=5, max_gap_seconds=300
+    )
+    assert r["point_count"] == 9 and r["interval_count"] == 8
+    assert (r["normal_count"], r["wrap_count"], r["reset_count"], r["unknown_count"]) == (
+        5, 1, 1, 1,
+    )
+    assert [iv["reason"] for iv in r["intervals"]] == [
+        "normal", "normal", "wrap", "normal", "unknown",
+        "normal", "reset", "normal",
+    ]
+    # 增量与逐区间速率
+    assert [iv["delta"] for iv in r["intervals"]] == [
+        10.0, 888.0, 7.0, 15.0, None, 10.0, None, 2.0,
+    ]
+    assert r["intervals"][2]["rate_per_second"] == 7.0 / 60
+    assert r["intervals"][4]["rate_per_second"] is None  # unknown
+    assert r["intervals"][6]["rate_per_second"] is None  # reset
+    # epoch 归属：前 4 个已知区间 epoch0；unknown 后 normal epoch1；reset 后 epoch2
+    assert [iv["epoch_index"] for iv in r["intervals"]] == [
+        0, 0, 0, 0, None, 1, None, 2,
+    ]
+    # 回卷区间：(1000 − 998) + 5 = 7；断档区间跨度 56 分钟
+    wrap_iv = r["intervals"][2]
+    assert wrap_iv["from_value"] == 998.0 and wrap_iv["to_value"] == 5.0
+    assert "回卷" in wrap_iv["reason_detail"]
+    assert r["intervals"][4]["elapsed_seconds"] == 56 * 60
+
+    # 三个 epoch 的索引 / 时间范围 / 累计
+    assert r["epoch_count"] == 3
+    e0, e1, e2 = r["epochs"]
+    assert (e0["start_index"], e0["end_index"]) == (0, 4)
+    assert e0["point_count"] == 5 and e0["interval_count"] == 4
+    assert e0["total_delta"] == 920.0 and e0["duration_seconds"] == 240.0
+    assert abs(e0["rate_per_second"] - 920.0 / 240.0) < 1e-12
+    assert (e1["start_index"], e1["end_index"]) == (5, 6)
+    assert e1["total_delta"] == 10.0 and e1["point_count"] == 2
+    assert (e2["start_index"], e2["end_index"]) == (7, 8)
+    assert e2["total_delta"] == 2.0
+    # 汇总只含 normal/wrap：920 + 10 + 2 = 932；时长 240 + 60 + 60 = 360
+    assert r["total_delta"] == 932.0
+    assert r["total_duration_seconds"] == 360.0
+    assert abs(r["rate_per_second"] - 932.0 / 360.0) < 1e-12
+    # 参数回显
+    assert (r["max_counter"], r["wrap_tolerance"], r["max_gap_seconds"]) == (
+        1000.0, 5.0, 300.0,
+    )
+    print("✓ 计数器速率：normal/wrap/reset/unknown 判定、epoch 切断与汇总排除正确")
+
+
+def test_counter_rates_wrap_tolerance_boundaries() -> None:
+    """回卷容差边界：恰好落在容差上按 wrap；单侧超界 / 后值为负按 reset。"""
+    from app.counter_rates import compute_counter_rates
+
+    base = ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z"]
+
+    # tol=0 且恰在边界：1000 -> 0，增量 (1000−1000)+0 = 0
+    exact = compute_counter_rates(base, [1000.0, 0.0], max_counter=1000, wrap_tolerance=0,
+                                  max_gap_seconds=None)
+    assert exact["intervals"][0]["reason"] == "wrap"
+    assert exact["intervals"][0]["delta"] == 0.0
+
+    # 两侧距离都恰等于容差（0.5 <= 0.6）→ wrap，增量 0.5+0.5 = 1.0
+    ok = compute_counter_rates(base, [999.5, 0.5], max_counter=1000, wrap_tolerance=0.6,
+                               max_gap_seconds=None)
+    assert ok["intervals"][0]["reason"] == "wrap"
+    assert ok["intervals"][0]["delta"] == 1.0
+
+    # 容差收紧到 0.4：两侧均超界 → reset
+    tight = compute_counter_rates(base, [999.5, 0.5], max_counter=1000, wrap_tolerance=0.4,
+                                  max_gap_seconds=None)
+    assert tight["intervals"][0]["reason"] == "reset"
+    assert tight["intervals"][0]["delta"] is None
+
+    # 仅前值侧在容差内、后值距 0 超出 → reset
+    one_side = compute_counter_rates(base, [999.0, 5.0], max_counter=1000, wrap_tolerance=2,
+                                     max_gap_seconds=None)
+    assert one_side["intervals"][0]["reason"] == "reset"
+
+    # 后值为负（距 0 的距离为负）→ reset
+    negative = compute_counter_rates(base, [999.0, -1.0], max_counter=1000, wrap_tolerance=5,
+                                     max_gap_seconds=None)
+    assert negative["intervals"][0]["reason"] == "reset"
+    print("✓ 计数器速率：回卷容差等号边界、单侧超界与负后值判 reset 正确")
+
+
+def test_counter_rates_no_max_counter_and_zero_delta() -> None:
+    """未提供 max_counter 时负增量一律 reset；零增量是 normal（速率 0）。"""
+    from app.counter_rates import compute_counter_rates
+
+    ts = ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z",
+          "2026-09-22T00:02:00Z", "2026-09-22T00:03:00Z"]
+    r = compute_counter_rates(
+        ts, [10.0, 12.0, 5.0, 7.0], max_counter=None, wrap_tolerance=0,
+        max_gap_seconds=None,
+    )
+    assert [iv["reason"] for iv in r["intervals"]] == ["normal", "reset", "normal"]
+    assert r["wrap_count"] == 0 and r["reset_count"] == 1
+    assert [iv["epoch_index"] for iv in r["intervals"]] == [0, None, 1]
+    assert r["epoch_count"] == 2
+    assert r["total_delta"] == 4.0 and r["total_duration_seconds"] == 120.0
+    assert abs(r["rate_per_second"] - 2.0 / 60.0) < 1e-12
+    assert r["max_counter"] is None and r["wrap_tolerance"] == 0.0
+
+    # 零增量：normal、速率 0，epoch 与汇总速率均为 0（而非 null）
+    flat = compute_counter_rates(
+        ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z"], [5.0, 5.0],
+        max_counter=None, wrap_tolerance=0, max_gap_seconds=None,
+    )
+    iv = flat["intervals"][0]
+    assert iv["reason"] == "normal" and iv["delta"] == 0.0 and iv["rate_per_second"] == 0.0
+    assert flat["epochs"][0]["rate_per_second"] == 0.0 and flat["rate_per_second"] == 0.0
+    print("✓ 计数器速率：无 max_counter 负增量判 reset、零增量 normal 与零速率正确")
+
+
+def test_counter_rates_gap_boundary_and_all_unknown() -> None:
+    """跨度 == max_gap 仍计入；略超即 unknown；全部 unknown 时汇总速率为 null。"""
+    from app.counter_rates import compute_counter_rates
+
+    # 跨度恰好 60s == max_gap：normal（≤ 含等号）
+    eq = compute_counter_rates(
+        ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z"], [0.0, 10.0],
+        max_counter=1000, wrap_tolerance=0, max_gap_seconds=60,
+    )
+    assert eq["intervals"][0]["reason"] == "normal" and eq["unknown_count"] == 0
+
+    # 61s > 60s：unknown；且 unknown 切断 epoch，汇总只保留前一段
+    over = compute_counter_rates(
+        ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z", "2026-09-22T00:02:01Z"],
+        [0.0, 10.0, 12.0],
+        max_counter=1000, wrap_tolerance=0, max_gap_seconds=60,
+    )
+    assert [iv["reason"] for iv in over["intervals"]] == ["normal", "unknown"]
+    assert len(over["epochs"]) == 1  # unknown 切断，仅有第一个 epoch（点 0..1）
+    assert over["epochs"][0]["start_index"] == 0 and over["epochs"][0]["end_index"] == 1
+    assert over["total_delta"] == 10.0 and over["total_duration_seconds"] == 60.0
+
+    # max_gap=0：任何非零跨度都 unknown，无 epoch，汇总速率 null
+    all_unknown = compute_counter_rates(
+        ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z", "2026-09-22T00:02:00Z"],
+        [0.0, 10.0, 20.0],
+        max_counter=1000, wrap_tolerance=0, max_gap_seconds=0,
+    )
+    assert all_unknown["unknown_count"] == 2 and all_unknown["epochs"] == []
+    assert all_unknown["total_delta"] == 0.0 and all_unknown["total_duration_seconds"] == 0.0
+    assert all_unknown["rate_per_second"] is None
+    print("✓ 计数器速率：max_gap 等号边界、超限 unknown 切断、全 unknown 汇总 null 正确")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -1575,9 +1742,150 @@ def _exercise_api(client: "TestClient") -> None:
     r = client.post("/api/v1/resample", json=edge)
     assert r.status_code == 200 and r.json()["point_count"] == 10000
 
+    # 无状态计数器速率：正常增量 / 回卷 / 重置 / 超长 unknown 四类区间
+    from datetime import datetime, timedelta, timezone
+
+    cr_base = datetime(2026, 9, 22, 0, 0, 0, tzinfo=timezone.utc)
+    cr_specs = [
+        (0, 100.0),    # 00:00
+        (60, 110.0),   # +10 normal
+        (120, 998.0),  # +888 normal
+        (180, 5.0),    # 回卷：距满量程 2、距 0 5，容差 5 → +7 wrap
+        (240, 20.0),   # +15 normal
+        (3600, 30.0),  # 跨度 3360s > 300s → unknown
+        (3660, 40.0),  # +10 normal（新 epoch）
+        (3720, 10.0),  # 负增量且不贴边界 → reset
+        (3780, 12.0),  # +2 normal（新 epoch）
+    ]
+    counter_payload = {
+        "series_id": "test-counter",
+        "max_counter": 1000,
+        "wrap_tolerance": 5,
+        "max_gap_seconds": 300,
+        "points": [
+            {"timestamp": (cr_base + timedelta(seconds=off)).isoformat(), "value": v}
+            for off, v in cr_specs
+        ],
+    }
+    r = client.post("/api/v1/counter-rates", json=counter_payload)
+    assert r.status_code == 200, r.text
+    cr = r.json()
+    assert cr["series_id"] == "test-counter"
+    assert cr["point_count"] == 9 and cr["interval_count"] == 8
+    assert (cr["normal_count"], cr["wrap_count"], cr["reset_count"], cr["unknown_count"]) == (
+        5, 1, 1, 1,
+    )
+    assert [iv["reason"] for iv in cr["intervals"]] == [
+        "normal", "normal", "wrap", "normal", "unknown",
+        "normal", "reset", "normal",
+    ]
+    assert [iv["delta"] for iv in cr["intervals"]] == [
+        10.0, 888.0, 7.0, 15.0, None, 10.0, None, 2.0,
+    ]
+    assert [iv["epoch_index"] for iv in cr["intervals"]] == [
+        0, 0, 0, 0, None, 1, None, 2,
+    ]
+    # 逐区间速率
+    assert abs(cr["intervals"][0]["rate_per_second"] - 10.0 / 60) < 1e-12
+    assert cr["intervals"][4]["rate_per_second"] is None
+    assert cr["intervals"][6]["rate_per_second"] is None
+    assert all("reason_detail" in iv and iv["reason_detail"] for iv in cr["intervals"])
+    # epoch 累计
+    assert cr["epoch_count"] == 3
+    assert [(e["start_index"], e["end_index"], e["total_delta"]) for e in cr["epochs"]] == [
+        (0, 4, 920.0), (5, 6, 10.0), (7, 8, 2.0),
+    ]
+    assert cr["epochs"][0]["point_count"] == 5 and cr["epochs"][0]["interval_count"] == 4
+    assert abs(cr["epochs"][0]["rate_per_second"] - 920.0 / 240.0) < 1e-12
+    # 汇总排除 reset/unknown：932 / 360s
+    assert cr["total_delta"] == 932.0 and cr["total_duration_seconds"] == 360.0
+    assert abs(cr["rate_per_second"] - 932.0 / 360.0) < 1e-12
+
+    # 乱序提交结果一致（服务端排序）
+    r = client.post(
+        "/api/v1/counter-rates",
+        json={**counter_payload, "points": list(reversed(counter_payload["points"]))},
+    )
+    assert r.status_code == 200 and r.json()["total_delta"] == 932.0
+
+    # 省略 max_counter：负增量一律 reset；省略 max_gap_seconds：长跨度仍是 normal
+    minimal_payload = {
+        "points": [
+            {"timestamp": "2026-09-22T00:00:00Z", "value": 10.0},
+            {"timestamp": "2026-09-22T01:00:00Z", "value": 2.0},
+        ]
+    }
+    r = client.post("/api/v1/counter-rates", json=minimal_payload)
+    assert r.status_code == 200, r.text
+    mb = r.json()
+    assert mb["intervals"][0]["reason"] == "reset"
+    assert mb["max_counter"] is None and mb["max_gap_seconds"] is None
+    assert mb["total_delta"] == 0 and mb["rate_per_second"] is None
+    assert mb["epochs"] == [] and mb["epoch_count"] == 0
+
+    # 回卷容差等号边界：恰在 max_counter 上回到 0，tol=0 按 wrap
+    edge_wrap = {
+        "max_counter": 1000,
+        "wrap_tolerance": 0,
+        "points": [
+            {"timestamp": "2026-09-22T00:00:00Z", "value": 1000.0},
+            {"timestamp": "2026-09-22T00:01:00Z", "value": 0.0},
+            {"timestamp": "2026-09-22T00:02:00Z", "value": 3.0},
+        ],
+    }
+    r = client.post("/api/v1/counter-rates", json=edge_wrap)
+    assert r.status_code == 200
+    eb = r.json()
+    assert [iv["reason"] for iv in eb["intervals"]] == ["wrap", "normal"]
+    assert eb["intervals"][0]["delta"] == 0.0
+    assert eb["epoch_count"] == 1 and eb["total_delta"] == 3.0
+
+    # 参数校验：不足 2 点 / 重复时间戳 / 负 max_counter / 负 max_gap /
+    # 负 wrap_tolerance / wrap_tolerance > max_counter
+    r = client.post("/api/v1/counter-rates", json={"points": counter_payload["points"][:1]})
+    assert r.status_code == 422
+    bad = dict(counter_payload)
+    bad["points"] = counter_payload["points"] + [counter_payload["points"][0]]
+    r = client.post("/api/v1/counter-rates", json=bad)
+    assert r.status_code == 422 and "重复时间戳" in r.text
+    for field, value in [
+        ("max_counter", -1),
+        ("max_gap_seconds", -0.1),
+        ("wrap_tolerance", -0.01),
+    ]:
+        bad = dict(counter_payload)
+        bad[field] = value
+        r = client.post("/api/v1/counter-rates", json=bad)
+        assert r.status_code == 422, (field, r.text)
+    bad = dict(counter_payload, max_counter=10, wrap_tolerance=11)
+    r = client.post("/api/v1/counter-rates", json=bad)
+    assert r.status_code == 422 and "wrap_tolerance" in r.text
+
+    # 非有限数值：value NaN、max_counter Infinity（httpx 会拒绝 NaN，手工构造原始请求体）
+    r = client.post(
+        "/api/v1/counter-rates",
+        content=_json.dumps({
+            "points": [
+                {"timestamp": "2026-09-22T00:00:00Z", "value": 1.0},
+                {"timestamp": "2026-09-22T00:01:00Z", "value": float("nan")},
+            ]
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+    r = client.post(
+        "/api/v1/counter-rates",
+        content=_json.dumps({
+            "max_counter": float("inf"),
+            "points": counter_payload["points"][:2],
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
     print(
         "✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / "
-        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样"
+        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样 / 计数器速率"
     )
 
 
@@ -1763,6 +2071,10 @@ if __name__ == "__main__":
     test_resample_subsecond_integer_microsecond_grid()
     test_resample_max_gap_boundary_and_cap()
     test_resample_separate_missing_runs()
+    test_counter_rates_normal_wrap_reset_unknown()
+    test_counter_rates_wrap_tolerance_boundaries()
+    test_counter_rates_no_max_counter_and_zero_delta()
+    test_counter_rates_gap_boundary_and_all_unknown()
     test_api_end_to_end()
     test_segment_status_workflow()
     print("\n全部冒烟测试通过 ✅")
